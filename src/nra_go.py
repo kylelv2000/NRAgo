@@ -95,8 +95,8 @@ def generate_init_solution(mytensor):
 
         y.backward(torch.ones(DIM))
         for name in mytensor.names:
-            init_result[name] = (mytensor.vars[mytensor.namemap[name][0]],
-                                 mytensor.vars.grad[mytensor.namemap[name][0]])
+            init_result[name] = (mytensor.vars[mytensor.namemap[name].id],
+                                 mytensor.vars.grad[mytensor.namemap[name].id])
 
         T2 = time.process_time()
         if torch.any(y < torch.zeros(DIM)):
@@ -138,7 +138,7 @@ def z3sol_with_val(formula, smt_logic, namemap, init_result):
         s.z3.set("timeout", Z3TIMELIMIT)       # ms
         s.add_assertion(formula)
         for (key, value) in init_result:
-            if namemap[key][1]:        # Real
+            if namemap[key].is_real:        # Real
                 if USEEPS:
                     lx = value - EPS
                     rx = value + EPS
@@ -183,7 +183,8 @@ def z3sol_protect(formula, smt_logic, namemap, init_result, subsets):
         except:
             result = []
         init_result = [(key, val) for (key, val)
-                       in init_result if namemap[key][0] not in result]
+                       in init_result if namemap[key].id not in result]
+
     with ThreadPoolExecutor(max_workers=1) as executor:
         try:
             future = executor.submit(
@@ -204,13 +205,13 @@ def parallel_sol(init_result, mytensor, formula, smt_logic):
             values = []
             for i in range(DIM):
                 val = vals_[i].float()
-                if mytensor.namemap[key_][1]:       # Real
+                if mytensor.namemap[key_].is_real:       # Real
                     val = float(format(val, '.2g'))
                     if abs(val) < 1e-5:
                         val = 0
                 init_vals[i].append((key_, val))
                 values.append(val)
-            nid = mytensor.namemap[key_][0]
+            nid = mytensor.namemap[key_].id
             mytensor.tensor_args[nid] = torch.tensor(values)
         mytensor.sol()
 

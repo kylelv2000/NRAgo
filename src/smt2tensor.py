@@ -16,6 +16,14 @@ class Smtworkerror(RuntimeError):
         self.args = [arg]
 
 
+class VariableInfo:
+    def __init__(self, id, is_real, lower_bound=None, upper_bound=None):
+        self.id = id
+        self.is_real = is_real
+        self.lower_bound = lower_bound
+        self.upper_bound = upper_bound
+
+
 class myTensor(object):
     acc_eps = 0
 
@@ -26,7 +34,7 @@ class myTensor(object):
         self.task_layer_cnt = 0
         self.tensor_args = {}
         self.and_task = []
-        self.arg_cnt = 0
+        self.arg_cnt = -1
         self.names = []             # 变量名
         self.namemap = {}           # 变量名到数组位置映射(id, Real变量=True)
 
@@ -47,16 +55,22 @@ class myTensor(object):
             LT: self.__lt,
             ITE: self.__ite,
         }
-
-    def add_real_arg(self, name):
-        self.namemap[name] = (self.arg_cnt, True)
-        self.names.append(name)
+    
+    def new_node(self) -> int:
         self.arg_cnt += 1
+        return self.arg_cnt
+
+
+    def add_real_arg(self, name, lower_bound=None, upper_bound=None):
+        id = self.new_node()
+        self.namemap[name] = VariableInfo(id, True, lower_bound, upper_bound)
+        self.names.append(name)
 
     def add_bool_arg(self, name):
-        self.namemap[name] = (self.arg_cnt, False)
+        id = self.new_node()
+        self.namemap[name] = VariableInfo(id, False)
         self.names.append(name)
-        self.arg_cnt += 1
+
 
     def parse_declare(self, symbol):
         type = symbol.symbol_type()
@@ -72,6 +86,7 @@ class myTensor(object):
         self.nodes.append(node)
 
     def make_not_node(self, node, layer, dim, is_and):
+        node_id = self.new_node()
         if layer > self.task_layer_cnt:
             self.task_layer_cnt += 1
             self.task_graph.append([])
@@ -81,14 +96,14 @@ class myTensor(object):
         tmp_list.append(tid)
         tmp_set = self.task_set[tid]
         self.task_graph[layer].append(
-            [self.__commands[type], self.arg_cnt, tmp_list])
-        self.task_set[self.arg_cnt] = tmp_set
+            [self.__commands[type], node_id, tmp_list])
+        self.task_set[node_id] = tmp_set
         if is_and and tmp_set:
-            self.and_task.append(self.arg_cnt)
-        self.arg_cnt += 1
-        return self.arg_cnt-1
+            self.and_task.append(node_id)
+        return node_id
 
     def init_graph(self, node, layer, dim, is_not, is_and=0):
+        node_id = self.new_node()
         if node.is_not():               # 下传not
             is_not ^= 1
             return self.init_graph(node.arg(0), layer, dim, is_not, is_and)
@@ -97,7 +112,7 @@ class myTensor(object):
                 return self.make_not_node(node, layer, dim, is_and)
 
         if node.is_symbol():          # 符号
-            return self.namemap[node.symbol_name()][0]
+            return self.namemap[node.symbol_name()].id
 
         if layer > self.task_layer_cnt:
             self.task_layer_cnt += 1
@@ -106,10 +121,9 @@ class myTensor(object):
         if node.is_constant():          # 常量
             x = node.constant_value()   # gmpy2类型
             self.task_graph[layer].append(
-                [self.__constant, self.arg_cnt, [float(x)]*dim])
-            self.task_set[self.arg_cnt] = set()
-            self.arg_cnt += 1
-            return self.arg_cnt-1
+                [self.__constant, node_id, [float(x)]*dim])
+            self.task_set[node_id] = set()
+            return node_id
 
         tmp_list = []
         args = node.args()
@@ -149,26 +163,25 @@ class myTensor(object):
             for arg in args:
                 tmp_list.append(self.init_graph(arg, layer+1, dim, 0, tis_and))
         self.task_graph[layer].append(
-            [self.__commands[type], self.arg_cnt, tmp_list])
+            [self.__commands[type], node_id, tmp_list])
 
         tmp_set = set()
         for tid in tmp_list:
             tmp_set = tmp_set | self.task_set[tid]
-        self.task_set[self.arg_cnt] = tmp_set
+        self.task_set[node_id] = tmp_set
         if is_and and type != AND and tmp_set:
-            self.and_task.append(self.arg_cnt)
-        self.arg_cnt += 1
-        return self.arg_cnt-1
+            self.and_task.append(node_id)
+
+        return node_id
 
     def init_tensor(self, dim):
         for name in self.names:
             tmp_set = set()
-            nid = self.namemap[name][0]
+            nid = self.namemap[name].id
             tmp_set.add(nid)
             self.task_set[nid] = tmp_set
-        self.task_graph.append([[self.__commands[AND], self.arg_cnt, []]])
-        self.answer_id = self.arg_cnt
-        self.arg_cnt += 1
+        self.answer_id = self.new_node()
+        self.task_graph.append([[self.__commands[AND], self.answer_id, []]])
         for node in self.nodes:
             self.task_graph[0][0][2].append(
                 self.init_graph(node, 1, dim, 0, 1))
@@ -267,8 +280,8 @@ class myTensor(object):
         self.falses = torch.full((dim,), float('inf'))
         tmp_list = []
         for name in self.names:
-            nid = self.namemap[name][0]
-            if self.namemap[name][1]:   # REAL
+            nid = self.namemap[name].id
+            if self.namemap[name].is_real:   # REAL
                 val = [0.15 - random.random() * 0.1 for _ in range(dim)]
             else:
                 val = [1 - random.randint(0, 1) * 2 for _ in range(dim)]
@@ -311,8 +324,8 @@ class myTensor(object):
         self.falses = torch.full((1,), float('inf'))
         grads = {}
         for (key, val, grad) in initval:
-            nid = self.namemap[key][0]
-            if self.namemap[key][1]:        # Real
+            nid = self.namemap[key].id
+            if self.namemap[key].is_real:        # Real
                 val = float(format(val, '.2g'))
                 if abs(val) < 1e-5:
                     val = 0
@@ -361,7 +374,7 @@ class myTensor(object):
         #         result.add(min_elem)
 
         # print(subsets, result)
-        return [(key, float(val)) for (key, val, grad) in initval if self.namemap[key][0] not in result]
+        return [(key, float(val)) for (key, val, grad) in initval if self.namemap[key].id not in result]
 
     def print_args(self, mss=None):
         if mss:
