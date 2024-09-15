@@ -18,8 +18,8 @@ done
 
 function parallel() {
     for folder in $@/*;do 
-        if [ ! -d results/$folder ];then
-            mkdir results/$folder
+        if [ ! -d results$folder ];then
+            mkdir results$folder
         fi
         state=-1
         for file in $folder/*;do
@@ -35,18 +35,18 @@ function parallel() {
         if [ $state -eq 0 ];then
             for i in $folder/*; do
                 echo $i
-                start=$[$(date +%s%N)/1000000]
-                timeout 1800 python3 src/nra_go.py $i > results/$i -W $workers
-                end=$[$(date +%s%N)/1000000]
-                take=$(( end - start ))
-                echo $i , ${take} ms >> times.csv
-                # read -u9
-                # {
-                #     python3 src/nra_go.py $i > results/$i
-                #     sleep 1
-                #     #控制进程数：一个任务完成后，写入一个空格字符到管道，新的任务将可以执行
-                #     echo >&9
-                # }&
+                # timeout 1800 python3 src/nra_go.py $i > results$i -W $workers
+                read -u9
+                {
+                    start=$[$(date +%s%N)/1000000]
+                    timeout 1800 python3 src/nra_go.py $i > results$i -W $workers
+                    end=$[$(date +%s%N)/1000000]
+                    take=$(( end - start ))
+                    echo $i , ${take} ms >> times.csv
+                    sleep 1
+                    #控制进程数：一个任务完成后，写入一个空格字符到管道，新的任务将可以执行
+                    echo >&9
+                }&
             done
         fi
         if [ $state -eq 1 ];then

@@ -9,7 +9,7 @@ import random
 import math
 import collections
 import networkx as nx
-
+from z3 import *
 
 class Smtworkerror(RuntimeError):
     def __init__(self, arg):
@@ -23,6 +23,12 @@ class VariableInfo:
         self.lower_bound = lower_bound
         self.upper_bound = upper_bound
 
+class RealNodeInfo:
+    def __init__(self, id, command, args):
+        self.id = id
+        self.command = command
+        self.args = args
+        self.task_graph = []
 
 class myTensor(object):
     acc_eps = 0
@@ -55,6 +61,20 @@ class myTensor(object):
             LT: self.__lt,
             ITE: self.__ite,
         }
+        self.bool_commands = {
+            self.__forall: FORALL,
+            self.__exists: EXISTS,
+            self.__and: AND,
+            self.__or: OR,
+            self.__not: NOT,
+            self.__implies: IMPLIES,
+            self.__iff: IFF,
+        }
+        self.bool_graph = {}    # {nodeid: [command, [argid_1, ...]}
+        self.function_nodes = []
+        self.real_nodes = {}    # {nodeid: [command, [argid_1, ...]}
+        self.variable_dict = {}
+        
     
     def new_node(self) -> int:
         self.arg_cnt += 1
@@ -172,6 +192,27 @@ class myTensor(object):
         if is_and and type != AND and tmp_set:
             self.and_task.append(node_id)
 
+        # 变量上下界
+        if is_and and type in (LE, LT, EQUALS):
+            if args[0].is_symbol() and args[1].is_constant():
+                var = self.namemap[args[0].symbol_name()]
+                val = float(args[1].constant_value())
+                if type in (LE, LT):
+                    if var.upper_bound is None or var.upper_bound > val:
+                        var.upper_bound = val
+                else:
+                    var.lower_bound = val
+                    var.upper_bound = val
+            elif args[1].is_symbol() and args[0].is_constant():
+                var = self.namemap[args[1].symbol_name()]
+                val = float(args[0].constant_value())
+                if type in (LE, LT):
+                    if var.lower_bound is None or var.lower_bound < val:
+                        var.lower_bound = val
+                else:
+                    var.lower_bound = val
+                    var.upper_bound = val
+
         return node_id
 
     def init_tensor(self, dim):
@@ -262,13 +303,18 @@ class myTensor(object):
 
     def __equals(self, args):
         y = (self.tensor_args[args[0]]-self.tensor_args[args[1]])
-        return y*y
+        return y*y + torch.log(1 + y*y)
+        # return y*y
 
     def __le(self, args):
-        return self.tensor_args[args[0]] - self.tensor_args[args[1]]
+        y = torch.max(self.zeros, self.tensor_args[args[0]] - self.tensor_args[args[1]])
+        return y*y + torch.log(1 + y)
+        # return self.tensor_args[args[0]] - self.tensor_args[args[1]]
 
     def __lt(self, args):
-        return self.tensor_args[args[0]] - self.tensor_args[args[1]]
+        y = torch.max(self.zeros, self.tensor_args[args[0]] - self.tensor_args[args[1]])
+        return y*y + torch.log(1 + y)
+        # return self.tensor_args[args[0]] - self.tensor_args[args[1]]
 
     def __ite(self, args):       # if( iff ) then  left  else  right
         raise Smtworkerror("qwq")
@@ -291,23 +337,158 @@ class myTensor(object):
         for i in range(l):
             self.tensor_args[i] = self.vars[i]
 
-    def pre_sol(self):                      # 化简常量
-        for layer in reversed(self.task_graph):
+    
+    def init_bool_tree(self):
+        for layer in self.task_graph:
             for oper in layer:
                 fun = oper[0]
-                ts = fun(oper[2])
-                if fun not in (self.__equals, self.__le, self.__lt) or not torch.allclose(ts, ts[0]):
-                    self.tensor_args[oper[1]] = ts
-                    continue
-                # 都是一个值的话基本说明变量改变无影响，因此说明这里是常量
-                if fun == self.__equals:
-                    self.tensor_args[oper[1]] = self.trues if ts[0] == 0.0 else self.falses
-                elif fun == self.__le:
-                    self.tensor_args[oper[1]] = self.trues if ts[0] <= 0.0 else self.falses
-                elif fun == self.__lt:
-                    self.tensor_args[oper[1]] = self.trues if ts[0] < 0.0 else self.falses
+                if fun in (self.__and, self.__or, self.__not, self.__implies, self.__iff): # bool
+                    fun = self.bool_commands[fun]
+                    self.bool_graph[oper[1]] = [fun, oper[2]]
+                elif fun in (self.__equals, self.__le, self.__lt):
+                    self.real_nodes[oper[1]] = RealNodeInfo(oper[1], fun, oper[2])
+                    self.function_nodes.append(oper[1])
+                else:
+                    self.real_nodes[oper[1]] = RealNodeInfo(oper[1], fun, oper[2])
+    
+    def build_task_graph(self, node_id):
+        fun = self.real_nodes[node_id].command
+        args = self.real_nodes[node_id].args
+        task_graph = [[[fun, node_id, args]]]
+        for nid in args:
+            if nid not in self.real_nodes:
+                continue
+            tg = [list(layer) for layer in self.real_nodes[nid].task_graph]
+            # 合并task_graph
+            depth = len(task_graph)
+            for i in range(len(tg)):
+                if i+1 < depth:
+                    task_graph[i+1].extend(tg[i])
+                else:
+                    task_graph.append(tg[i])
+        self.real_nodes[node_id].task_graph = [list(layer) for layer in task_graph]
 
-        return self.tensor_args[self.answer_id]
+    def init_real_tree(self):
+        for layer in reversed(self.task_graph):
+            for oper in layer:
+                node_id = oper[1]
+                if node_id not in self.real_nodes:
+                    continue
+                self.build_task_graph(node_id)
+
+    
+    def build_expression(self, node_id):
+        if node_id in self.function_nodes:
+            if node_id in self.variable_dict:
+                return self.variable_dict[node_id]
+            else:
+                var = Bool('xn' + str(node_id))
+                self.variable_dict[node_id] = var
+                return var
+        fun, args = self.bool_graph[node_id]
+        if fun == AND:
+            return And(*[self.build_expression(arg) for arg in args])
+        elif fun == OR:
+            return Or(*[self.build_expression(arg) for arg in args])
+        elif fun == NOT:
+            return Not(self.build_expression(args[0]))
+        elif fun == IMPLIES:
+            return Implies(self.build_expression(args[0]), self.build_expression(args[1]))
+        elif fun == IFF:
+            return And(Implies(self.build_expression(args[0]), self.build_expression(args[1])), 
+                                Implies(self.build_expression(args[1]), self.build_expression(args[0])))
+
+    def build_goal(self):
+        goals = []
+        for node_id in self.function_nodes:
+            if self.real_nodes[node_id].command == self.__equals:
+                goals.append(If(self.variable_dict[node_id], 100, 0))
+            else:
+                goals.append(If(self.variable_dict[node_id], 1, 0))
+        return Sum(goals)
+    
+    def bool_sol(self):
+        expr = self.build_expression(self.answer_id)
+        opt = Optimize()
+        opt.add(expr)
+        optimization_expr = self.build_goal()
+        opt.minimize(optimization_expr)
+        if opt.check() != sat:
+            return None
+        model = opt.model()
+        
+        need_vars = []
+        for nid in self.function_nodes:
+            val = model.eval(self.variable_dict[nid])
+            if val == True:
+                need_vars.append(nid)
+
+        return need_vars
+    
+    def new_sol(self):
+        self.init_bool_tree()
+        self.init_real_tree()
+        need_vars = self.bool_sol()
+        if need_vars is None:
+            return None
+        
+        task_graph = [[[self.__commands[AND], self.answer_id, need_vars]]]
+        for nid in need_vars:
+            depth = len(task_graph)
+            tg = [list(layer) for layer in self.real_nodes[nid].task_graph]
+            for i in range(len(tg)):
+                if i+1 < depth:
+                    task_graph[i+1].extend(tg[i])
+                else:
+                    task_graph.append(tg[i])
+
+        self.real_nodes[self.answer_id] = RealNodeInfo(self.answer_id, self.__and, need_vars)
+        self.real_nodes[self.answer_id].task_graph = [list(layer) for layer in task_graph]
+
+
+    def get_need_vars(self):
+        return self.real_nodes[self.answer_id].args
+    
+    def new_iteration(self, nid = None):
+        if nid is None:
+            nid = self.answer_id
+        task_graph = self.real_nodes[nid].task_graph
+        for layer in reversed(task_graph):
+            for oper in layer:
+                fun = oper[0]
+                self.tensor_args[oper[1]] = fun(oper[2])
+
+        return self.tensor_args[nid]
+
+    # 检查如果变量超过边界，则强制赋值
+    def bound_check(self):
+        for name in self.names:
+            v = self.namemap[name]
+            lb = v.lower_bound
+            ub = v.upper_bound
+            with torch.no_grad():
+                if lb is not None:
+                    self.vars[v.id] = torch.max(self.vars[v.id], torch.tensor(lb))
+                if ub is not None:
+                    self.vars[v.id] = torch.min(self.vars[v.id], torch.tensor(ub))
+
+    # def pre_sol(self):                      # 化简常量
+    #     for layer in reversed(self.task_graph):
+    #         for oper in layer:
+    #             fun = oper[0]
+    #             ts = fun(oper[2])
+    #             if fun not in (self.__equals, self.__le, self.__lt) or not torch.allclose(ts, ts[0]):
+    #                 self.tensor_args[oper[1]] = ts
+    #                 continue
+    #             # 都是一个值的话基本说明变量改变无影响，因此说明这里是常量
+    #             if fun == self.__equals:
+    #                 self.tensor_args[oper[1]] = self.trues if ts[0] == 0.0 else self.falses
+    #             elif fun == self.__le:
+    #                 self.tensor_args[oper[1]] = self.trues if ts[0] <= 0.0 else self.falses
+    #             elif fun == self.__lt:
+    #                 self.tensor_args[oper[1]] = self.trues if ts[0] < 0.0 else self.falses
+
+    #     return self.tensor_args[self.answer_id]
 
     def sol(self):
         for layer in reversed(self.task_graph):
@@ -353,27 +534,6 @@ class myTensor(object):
             result = [matching[subset] for subset in funcs if subset in matching]
         except:
             result = []
-        # subsets = sorted(subsets, key=len)
-        # counter = collections.Counter(
-        #     elem for subset in subsets for elem in subset)
-        # result = set()
-
-        # for subset in subsets:
-        #     min_elem = None
-        #     for id in subset:
-        #         if id in result:
-        #             continue
-        #         if min_elem is None or counter[min_elem] > counter[id] or (counter[min_elem] == counter[id] and grads[min_elem] > grads[id]):
-        #             min_elem = id
-
-        #         counter[id] -= 1
-        #         if counter[id] == 0:
-        #             del counter[id]
-        #     # print(min_elem)
-        #     if min_elem is not None:
-        #         result.add(min_elem)
-
-        # print(subsets, result)
         return [(key, float(val)) for (key, val, grad) in initval if self.namemap[key].id not in result]
 
     def print_args(self, mss=None):

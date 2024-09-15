@@ -15,7 +15,7 @@ from tqdm import tqdm
 
 DEBUG = False
 MAXWORKERS = None       # ProcessPoolExecutor default is None
-DIM = 1024
+DIM = 2
 Z3TIMELIMIT = 10000     # ms
 THREADTIMELIMIT = Z3TIMELIMIT/1000
 PROCESSTIMELIMIT = THREADTIMELIMIT + 1
@@ -75,35 +75,64 @@ def generate_init_solution(mytensor):
     global Epochs, Lr
     init_result = {}
     mytensor.init_val(DIM)
-    T1 = time.process_time()
-    y = mytensor.pre_sol()  # 化简常量，顺便记录sol时间
-    T2 = time.process_time()
-    if T2-T1 > 0.8:
-        new_epochs = int(ITERTIMELIMIT*0.5/(T2-T1))
-        Lr *= new_epochs/Epochs
+
+    optimizer = torch.optim.Adam([mytensor.vars], lr=Lr)
+
+
+    def optimize_subtree(subtree, optimizer, steps):
+        for _ in range(steps):
+            optimizer.zero_grad()
+            ty = mytensor.new_iteration(subtree)
+            if not ty.requires_grad:
+                ty.requires_grad_(True)
+            ty.backward(torch.ones(DIM))
+            optimizer.step()
+            if torch.any(ty < torch.zeros(DIM)):
+                return subtree
+        return subtree
+    
+    def run_one_epoch(step):
+        need_vars = mytensor.get_need_vars()
+        need_vars_ = tqdm(need_vars) if DEBUG else need_vars
+        for nid in need_vars_:
+            optimize_subtree(nid, optimizer, steps=3)
+
+        adjust_learning_rate(optimizer, step, Lr)
+        optimizer.zero_grad()
+        y = mytensor.sol()
+        y.backward(torch.ones(DIM))
+        optimizer.step()
+
+        mytensor.bound_check()
+        
+        for name in mytensor.names:
+            init_result[name] = (mytensor.vars[mytensor.namemap[name].id],
+                                 mytensor.vars.grad[mytensor.namemap[name].id])
+        
+        return y
+    
+    T1 = time.perf_counter()
+    run_one_epoch(0)
+    # y = mytensor.pre_sol()  # 化简常量，顺便记录sol时间
+    T2 = time.perf_counter()
+    if T2-T1 > 2:
+        new_epochs = int(ITERTIMELIMIT*1.8/(T2-T1))
+    #     Lr *= new_epochs/Epochs
         Epochs = new_epochs
 
     if DEBUG:
         print('程序运行时间1:%s毫秒' % ((T2 - T1)*1000))
         print(Epochs)
 
-    optimizer = torch.optim.Adam([mytensor.vars], lr=Lr)
-    for step in tqdm(range(Epochs)) if DEBUG else range(Epochs):
-        adjust_learning_rate(optimizer, step, Lr)
-        optimizer.zero_grad()
-        y = mytensor.sol()
-
-        y.backward(torch.ones(DIM))
-        for name in mytensor.names:
-            init_result[name] = (mytensor.vars[mytensor.namemap[name].id],
-                                 mytensor.vars.grad[mytensor.namemap[name].id])
-
-        T2 = time.process_time()
+    epochs_ = tqdm(range(Epochs)) if DEBUG else range(Epochs)
+    for step in epochs_:
+        y = run_one_epoch(step)
         if torch.any(y < torch.zeros(DIM)):
             return None
-        if T2-T1 > ITERTIMELIMIT:
-            break
-        optimizer.step()
+        
+        # T2 = time.perf_counter()
+        # if T2-T1 > ITERTIMELIMIT:
+        #     break
 
     return init_result
 
@@ -247,6 +276,9 @@ def solve(path):
     formula = get_smt_formula(path)
 
     mytensor = init_tensor(script)
+
+    mytensor.new_sol()
+
     init_result = generate_init_solution(mytensor)
 
     if init_result is None:         # sat
